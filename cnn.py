@@ -88,18 +88,20 @@ input_layer = Input(shape=input_shape)
 
 conv1 = Conv2D(32, (3, 3), activation='relu', padding='same')(input_layer)
 conv1 = BatchNormalization()(conv1)
-pool1 = MaxPooling2D((2, 2))(conv1)
+pool1 = MaxPooling2D((2, 2), padding = 'same')(conv1)
 
 conv2 = Conv2D(64, (3, 3), activation='relu', padding='same')(pool1)
 conv2 = BatchNormalization()(conv2)
-pool2 = MaxPooling2D((2, 2))(conv2)
+pool2 = MaxPooling2D((2, 2), padding = 'same')(conv2)
 
 conv3 = Conv2D(128, (3, 3), activation='relu', padding='same')(pool2)
 conv3 = BatchNormalization()(conv3)
-pool3 = MaxPooling2D((2, 2))(conv3)
+pool3 = MaxPooling2D((2, 2), padding = 'same')(conv3)
 
+print("Shape before Flatten:", pool3.shape)
 
-flat = Flatten()(pool3)
+flat_input = tf.keras.layers.Reshape((-1,))(pool3)
+flat = Flatten()(flat_input)
 dense1 = Dense(128, activation='relu')(flat)
 dense1 = Dropout(0.3)(dense1)
 output_layer = Dense(len(AUDIO_CLASSES), activation='softmax')(dense1)
@@ -113,7 +115,7 @@ model = Model(inputs=input_layer, outputs=output_layer)
 
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
-history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=70, batch_size=32)
+history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=50, batch_size=32)
 
 
 layers = [conv1, pool1, conv2, pool2, conv3, pool3]
@@ -188,7 +190,6 @@ model.summary()
 from scipy.ndimage import zoom
 
 def resize_feature_map(feature, target_shape):
-    """Resize feature map to match the target shape."""
     zoom_factors = [target / source for target, source in zip(target_shape, feature.shape)]
     return zoom(feature, zoom_factors, order=1)  # Linear interpolation
 
@@ -196,14 +197,16 @@ def resize_feature_map(feature, target_shape):
 # %%
 def extract_features(model, X, layers):
     feature_extractor = Model(inputs=model.input, outputs=layers)
-    return feature_extractor.predict(X)
+    features = feature_extractor.predict(X)
+    print("extracted feature shape: ", features[5].shape)
+    return features
 
 # %%
 from scipy.spatial.distance import cdist
 
 def check_similarity(features1, features2, similarity_method = "euclidean"):
-    # if features1.shape != features2.shape:
-    #     features2 = resize_feature_map(features2, features1.shape)  # Resize to match
+    if features1.shape != features2.shape:
+        features2 = resize_feature_map(features2, features1.shape)  # Resize to match
     # if similarity_method == "cosine":
     #     return 1 - cosine(features1.flatten(), features2.flatten())
     # elif similarity_method == "euclidean":
@@ -225,14 +228,31 @@ def find_most_similar(features, layer_idx, feature_idx, metric="cosine"):
         if j != feature_idx:
             candidate_feature = features[layer_idx][j]
             similarity = check_similarity(reference_feature, candidate_feature, metric)
-            similarities.append(similarity)
-    most_similar_idx = np.argmax(similarities)
-    return most_similar_idx, similarities[most_similar_idx]
+            similarities.append((j, similarity))
+    most_similar_idx, max_similarity = max(similarities, key = lambda x: x[1]) #
+    return most_similar_idx, max_similarity
 
 # %%
 def compare_outputs(model, features, idx, most_similar_idx, self_idx):
-    original_output = model.predict(np.expand_dims(features[idx][self_idx], axis=0))
-    similar_output = model.predict(np.expand_dims(features[idx][most_similar_idx], axis=0))
+    print(f"Shape of features[{idx}][{self_idx}]:", features[idx][self_idx].shape)
+    print(f"Shape of features[{idx}][{most_similar_idx}]:", features[idx][most_similar_idx].shape)
+    
+    # original_feature = np.expand_dims(features[idx][self_idx], axis=0)
+    # similar_feature = np.expand_dims(features[idx][most_similar_idx], axis=0)
+    
+    original_feature = features[idx][self_idx]
+    similar_feature = features[idx][most_similar_idx]
+    
+    if original_feature.shape != similar_feature.shape:
+        similar_feature = resize_feature_map(similar_feature, original_feature.shape)
+    print(f"Shape after expand_dims: original={original_feature.shape}, similar={similar_feature.shape}")
+    
+    #check if expand dims is actually necessary
+    original_feature = np.expand_dims(original_feature, axis=0)
+    similar_feature = np.expand_dims(similar_feature, axis=0)
+    
+    original_output = model.predict(original_feature)
+    similar_output = model.predict(similar_feature)
     return np.allclose(original_output, similar_output), original_output, similar_output
 
 # %%
@@ -276,17 +296,26 @@ def analyze_features_and_outputs(model, X, feature_layers):
                 print("yes, same output")
                 seperation_idx[class_idx][layer_idx] += 1 #
             
-            results.append({
-                "layer_idx": layer_idx,
-                "feature_idx": feature_idx,
-                "most_similar_idx": most_similar_idx,
-                "similarity": similarity,
-                "same_output": same_output,
-                "original_output": original_output,
-                "similar_output": similar_output
-            })
+            # results.append({
+            #     "layer_idx": layer_idx,
+            #     "feature_idx": feature_idx,
+            #     "most_similar_idx": most_similar_idx,
+            #     "similarity": similarity,
+            #     "same_output": same_output,
+            #     "original_output": original_output,
+            #     "similar_output": similar_output
+            # })
     
-    return results
+    return seperation_idx
+
+
+# %%
+print("Input shape:", X_train[0].shape)
+
+
+# %%
+for layer in [conv1, pool1, conv2, pool2, conv3, pool3]:
+    print(layer.name, "output shape:", layer.shape)
 
 
 # %%
@@ -312,11 +341,11 @@ def plot_SI_per_layer(seperation_idx, class_idx, layer_names):
     
     
 feature_layers = [conv1, pool1, conv2, pool2, conv3, pool3]
-results = analyze_features_and_outputs(model, X_test, feature_layers)
+seperation_idx = analyze_features_and_outputs(model, X_test, feature_layers)
 
 
-for res in results:
-    print(f"Layer {res['layer_idx']} - Feature {res['feature_idx']} - Similarity: {res['similarity']:.4f} - Same Output: {res['same_output']}")
+# for res in results:
+#     print(f"Layer {res['layer_idx']} - Feature {res['feature_idx']} - Similarity: {res['similarity']:.4f} - Same Output: {res['same_output']}")
    
 print("\nSeparation Index Matrix:")
 for row in seperation_idx:
