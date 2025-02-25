@@ -25,6 +25,13 @@ water = os.path.join(DATASET_PATH, "Water/")
 AUDIO_CLASSES = ["Blender", "Light_Switch", "Toaster", "Water"]
 
 # %%
+def save_as_numpy(X, y, output_path = "mfcc_features.npz"):
+    np.savez(output_path, X = X, y = y)
+
+# %%
+from sklearn.utils import shuffle
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import Dropout
 def load_and_preprocess_audio(dataset_path, classes, sr=22050, n_mels=128, max_frames=216):
     X, y = [], []
     for idx, label in enumerate(classes):
@@ -44,6 +51,8 @@ def load_and_preprocess_audio(dataset_path, classes, sr=22050, n_mels=128, max_f
 
                 X.append(mel_spec_db)
                 y.append(idx)
+                
+    save_as_numpy(X, y)
     X = np.array(X)
     y = np.array(y)
     return X, y
@@ -60,6 +69,8 @@ X = np.expand_dims(X, axis=-1)
 
 print(f"size X: {X.shape}")
 print(f"size y: {y.shape}")
+
+X, y = shuffle(X, y, random_state=42)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 print(f"size X_train: {X_train.shape}")
@@ -76,24 +87,33 @@ input_layer = Input(shape=input_shape)
 
 
 conv1 = Conv2D(32, (3, 3), activation='relu', padding='same')(input_layer)
+conv1 = BatchNormalization()(conv1)
 pool1 = MaxPooling2D((2, 2))(conv1)
 
 conv2 = Conv2D(64, (3, 3), activation='relu', padding='same')(pool1)
+conv2 = BatchNormalization()(conv2)
 pool2 = MaxPooling2D((2, 2))(conv2)
 
 conv3 = Conv2D(128, (3, 3), activation='relu', padding='same')(pool2)
+conv3 = BatchNormalization()(conv3)
 pool3 = MaxPooling2D((2, 2))(conv3)
 
 
 flat = Flatten()(pool3)
 dense1 = Dense(128, activation='relu')(flat)
+dense1 = Dropout(0.3)(dense1)
 output_layer = Dense(len(AUDIO_CLASSES), activation='softmax')(dense1)
 
+from sklearn.utils.class_weight import compute_class_weight
 
 model = Model(inputs=input_layer, outputs=output_layer)
+
+# class_weights = compute_class_weight("balanced", classes=np.unique(np.argmax(y_train, axis=1)), y=np.argmax(y_train, axis=1))
+# class_weights_dict = {i: class_weights[i] for i in range(len(AUDIO_CLASSES))}
+
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
-history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=10, batch_size=32)
+history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=70, batch_size=32)
 
 
 layers = [conv1, pool1, conv2, pool2, conv3, pool3]
@@ -179,32 +199,40 @@ def extract_features(model, X, layers):
     return feature_extractor.predict(X)
 
 # %%
-def check_similarity(features1, features2, similarity_method):
-    if features1.shape != features2.shape:
-        features2 = resize_feature_map(features2, features1.shape)  # Resize to match
-    if similarity_method == "cosine":
-        return 1 - cosine(features1.flatten(), features2.flatten())
-    elif similarity_method == "euclidean":
-        return -np.linalg.norm(features1 - features2)
+from scipy.spatial.distance import cdist
+
+def check_similarity(features1, features2, similarity_method = "euclidean"):
+    # if features1.shape != features2.shape:
+    #     features2 = resize_feature_map(features2, features1.shape)  # Resize to match
+    # if similarity_method == "cosine":
+    #     return 1 - cosine(features1.flatten(), features2.flatten())
+    # elif similarity_method == "euclidean":
+    #     return -np.linalg.norm(features1 - features2)
+    
+    features1 = features1.reshape(1, -1)
+    features2 = features2.reshape(1, -1)
+    
+    distance = cdist(features1, features2, metric = similarity_method)
+    return 1 - distance[0, 0]
 
 # %%
-def find_most_similar(features, idx, feature_idx, metric="cosine"):
-    print("idx: ", idx)
+def find_most_similar(features, layer_idx, feature_idx, metric="cosine"):
+    print("layer_idx: ", layer_idx)
     print("feature_idx: ", feature_idx)
-    reference_feature = features[idx][feature_idx] #find the exact feature that we are working with right now
+    reference_feature = features[layer_idx][feature_idx] #find the exact feature that we are working with right now
     similarities = []
-    for j in range(len(features[idx])):
+    for j in range(len(features[layer_idx])):
         if j != feature_idx:
-            candidate_feature = features[idx][j]
+            candidate_feature = features[layer_idx][j]
             similarity = check_similarity(reference_feature, candidate_feature, metric)
             similarities.append(similarity)
     most_similar_idx = np.argmax(similarities)
     return most_similar_idx, similarities[most_similar_idx]
 
 # %%
-def compare_outputs(model, X, idx, most_similar_idx):
-    original_output = model.predict(np.expand_dims(X[idx], axis=0))
-    similar_output = model.predict(np.expand_dims(X[most_similar_idx], axis=0))
+def compare_outputs(model, features, idx, most_similar_idx, self_idx):
+    original_output = model.predict(np.expand_dims(features[idx][self_idx], axis=0))
+    similar_output = model.predict(np.expand_dims(features[idx][most_similar_idx], axis=0))
     return np.allclose(original_output, similar_output), original_output, similar_output
 
 # %%
@@ -212,7 +240,12 @@ def calculate_seperation_index(seperation_idx, output):
     return (seperation_idx[output] + 1)
 
 # %%
-seperation_idx = [0] * len(AUDIO_CLASSES)
+feature_layers = [conv1, pool1, conv2, pool2, conv3, pool3]
+
+
+# %%
+seperation_idx = [[0 for _ in range(6)] for _ in range(len(AUDIO_CLASSES))]
+
 def analyze_features_and_outputs(model, X, feature_layers):
     
     features = extract_features(model, X, feature_layers)
@@ -225,23 +258,26 @@ def analyze_features_and_outputs(model, X, feature_layers):
 
     # seperation_idx = [output for i,output in enumerate(AUDIO_CLASSES)]
 
-    for idx in range(len(features)):
+    for layer_idx, feature_set in enumerate(features):
+        print(f"Layer {layer_idx} has {len(feature_set)} features")
         for feature_idx in range(len(feature_set)):
             
-            most_similar_idx, similarity = find_most_similar(features, idx, feature_idx)
-    
+            most_similar_idx, similarity = find_most_similar(features, layer_idx, feature_idx) #idx shouldn't be passed on to this function or should be calculated 
+            
             
             same_output, original_output, similar_output = compare_outputs(
-                model, X, idx, most_similar_idx
+                model, features, layer_idx, most_similar_idx, feature_idx
             )
             
-            class_idx = np.argmax(original_output)
+            print("this is original output:", original_output)
+            class_idx = np.argmax(original_output) #this is always returning 0
             
             if(same_output):
-                seperation_idx[class_idx] += 1
+                print("yes, same output")
+                seperation_idx[class_idx][layer_idx] += 1 #
             
             results.append({
-                "layer_idx": idx,
+                "layer_idx": layer_idx,
                 "feature_idx": feature_idx,
                 "most_similar_idx": most_similar_idx,
                 "similarity": similarity,
@@ -256,25 +292,38 @@ def analyze_features_and_outputs(model, X, feature_layers):
 # %%
 import matplotlib.pyplot as plt
 
-def plot_separation_index(separation_idx, class_names, class_idx):
+def plot_SI_per_layer(seperation_idx, class_idx, layer_names):
+    num_layers = len(layer_names)
 
+    # Extract SI values for the selected class
+    si_values = [seperation_idx[class_idx][layer] for layer in range(num_layers)]
+
+    # Plot
     plt.figure(figsize=(8, 5))
-    plt.bar(range(len(separation_idx)), separation_idx, color='blue', alpha=0.7)
+    plt.plot(layer_names, si_values, marker='o', linestyle='-', color='b', label=f'Class {class_idx} SI')
     plt.xlabel("Layers")
     plt.ylabel("Separation Index")
-    plt.title(f"Separation Index for {class_names[class_idx]}")
-    plt.xticks(range(len(separation_idx)), labels=[f"Layer {i+1}" for i in range(len(separation_idx))], rotation=45)
+    plt.title(f"Separation Index per Layer for Class {class_idx}")
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.grid(True)
     plt.show()
-
+    
+    
+    
 feature_layers = [conv1, pool1, conv2, pool2, conv3, pool3]
 results = analyze_features_and_outputs(model, X_test, feature_layers)
 
 
 for res in results:
     print(f"Layer {res['layer_idx']} - Feature {res['feature_idx']} - Similarity: {res['similarity']:.4f} - Same Output: {res['same_output']}")
-
-class_idx = 0  
-plot_separation_index(seperation_idx, AUDIO_CLASSES, class_idx)
-
+   
+print("\nSeparation Index Matrix:")
+for row in seperation_idx:
+    print(row)
+ 
+class_idx = 0
+layer_names = ["conv1", "pool1", "conv2", "pool2", "conv3", "pool3"]
+plot_SI_per_layer(seperation_idx, class_idx, layer_names)
 
 
